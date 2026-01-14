@@ -1,21 +1,29 @@
 package pkg
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 var (
 	Magic          = [26]byte{'K', 'e', 'e', 'p', 'C', 'a', 'l', 'm', 'A', 'n', 'd', 'F', 'u', 'c', 'k', 'T', 'h', 'e', 'R', 'u', 's', 's', 'i', 'a', 'n', 's'}
-	Version uint16 = 1
+	Version uint16 = 2
 )
 
 const (
 	FlagCompressed = 1 << 0
 )
+
+// ---------- FILE STRUCTURES ----------
 
 type FileHeader struct {
 	Magic     [26]byte
@@ -25,9 +33,9 @@ type FileHeader struct {
 }
 
 type IndexEntry struct {
-	PathLength uint16
-	Path       string
-
+	PathOffset      uint32
+	PathLength      uint16
+	Flags           uint16
 	DataOffset      uint64
 	CompressionSize uint64
 	RawSize         uint64
@@ -38,94 +46,80 @@ type PackOptions struct {
 	IncludeParent bool
 }
 
-// SQAR Compression system
+// ---------- STRING TABLE ----------
+
+type StringTable struct {
+	strings map[string]uint32
+	buf     bytes.Buffer
+}
+
+func NewStringTable() *StringTable {
+	return &StringTable{strings: make(map[string]uint32)}
+}
+
+func (st *StringTable) Add(s string) uint32 {
+	if off, ok := st.strings[s]; ok {
+		return off
+	}
+	off := uint32(st.buf.Len())
+	st.buf.WriteString(s)
+	st.strings[s] = off
+	return off
+}
+
+func (st *StringTable) Bytes() []byte { return st.buf.Bytes() }
+
+// ---------- COMPRESSION ----------
 
 const (
-	minMatch = 4
-	window   = 65535
+	entrySize = 4 + 2 + 2 + 8 + 8 + 8 // PathOffset + PathLength + Flags + DataOffset + CompressionSize + RawSize
 )
 
-func sqarCompress(src []byte) []byte {
-	out := make([]byte, 0, len(src))
-	i := 0
-
-	for i < len(src) {
-		bestLen := 0
-		bestOff := 0
-
-		start := i - window
-		if start < 0 {
-			start = 0
-		}
-
-		for j := i - 1; j >= start; j-- {
-			l := 0
-			for i+l < len(src) && src[j+1] == src[i+l] {
-				l++
-				if l >= 18 {
-					break
-				}
-			}
-			if l >= minMatch && l > bestLen {
-				bestLen = l
-				bestOff = i - j
-			}
-		}
-
-		if bestLen >= minMatch {
-			token := byte(bestLen - minMatch)
-			out = append(out, token)
-			out = append(out, byte(bestOff), byte(bestOff>>8))
-			i += bestLen
-		} else {
-			out = append(out, 0xF0|1)
-			out = append(out, src[i])
-			i++
-		}
-	}
-
-	return out
+var skipCompressExt = map[string]bool{
+	".zip": true, ".gz": true, ".mp3": true, ".mp4": true,
+	".png": true, ".jpg": true, ".jpeg": true,
 }
 
-func sqarDecompress(src []byte, rawSize uint64) []byte {
-	out := make([]byte, 0, rawSize)
-	i := 0
-
-	for i < len(src) {
-		token := src[i]
-		i++
-
-		litLen := int(token >> 4)
-		matchLen := int(token&0x0F) + minMatch
-
-		if litLen > 0 {
-			out = append(out, src[i:i+litLen]...)
-			i += litLen
-			continue
-		}
-
-		off := int(src[i]) | int(src[i+1])<<8
-		i += 2
-
-		start := len(out) - off
-		for j := 0; j < matchLen; j++ {
-			out = append(out, out[start+j])
-		}
-	}
-
-	return out
+func shouldCompress(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return !skipCompressExt[ext]
 }
 
-func Pack(src, out string, opts PackOptions) error {
+var (
+	zstdEnc *zstd.Encoder
+	zstdDec *zstd.Decoder
+)
+
+func init() {
+	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	dec, _ := zstd.NewReader(nil)
+	zstdEnc = enc
+	zstdDec = dec
+}
+
+func compressBytes(src []byte) ([]byte, error) {
+	out := zstdEnc.EncodeAll(src, nil)
+	return out, nil
+}
+
+func decompressBytes(src []byte) ([]byte, error) {
+	out, err := zstdDec.DecodeAll(src, nil)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---------- PACK ----------
+
+func Pack(src, outPath string, opts PackOptions) error {
 	src = filepath.Clean(src)
-	baseDirectory := src
+	baseDir := src
 	if !opts.IncludeParent {
-		baseDirectory = filepath.Dir(src)
+		baseDir = filepath.Dir(src)
 	}
 
 	var paths []string
-
-	// Scan recursively through the source directory
 	err := filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -139,12 +133,12 @@ func Pack(src, out string, opts PackOptions) error {
 		return err
 	}
 
-	type stagedFile struct {
+	staged := []struct {
 		entry IndexEntry
 		data  []byte
-	}
+	}{}
 
-	var staged []stagedFile
+	st := NewStringTable()
 
 	for _, p := range paths {
 		raw, err := os.ReadFile(p)
@@ -152,107 +146,168 @@ func Pack(src, out string, opts PackOptions) error {
 			return err
 		}
 
-		payload := raw
-		if opts.Compress {
-			payload = sqarCompress(raw)
+		rel, _ := filepath.Rel(baseDir, p)
+		rel = filepath.ToSlash(rel)
+		pathOffset := st.Add(rel)
+
+		entry := IndexEntry{
+			PathOffset: pathOffset,
+			PathLength: uint16(len(rel)),
+			Flags:      0,
 		}
 
-		rel, _ := filepath.Rel(baseDirectory, p)
-		rel = filepath.ToSlash(rel)
+		payload := raw
+		if opts.Compress && shouldCompress(p) {
+			c, err := compressBytes(raw)
+			if err != nil {
+				return err
+			}
+			payload = c
+			entry.Flags = 1
+		}
 
-		staged = append(staged, stagedFile{
-			entry: IndexEntry{
-				Path:            rel,
-				PathLength:      uint16(len(rel)),
-				CompressionSize: uint64(len(payload)),
-				RawSize:         uint64(len(raw)),
-			},
-			data: payload,
-		})
+		entry.CompressionSize = uint64(len(payload))
+		entry.RawSize = uint64(len(raw))
+
+		staged = append(staged, struct {
+			entry IndexEntry
+			data  []byte
+		}{entry: entry, data: payload})
 	}
 
-	indexSize := uint64(0)
-	for _, s := range staged {
-		indexSize += 2 + uint64(len(s.entry.Path)) + 8 + 8 + 8
-	}
+	// include 4 bytes for entry count
+	indexSize := uint64(len(st.Bytes())) + uint64(len(staged))*uint64(entrySize) + 4
 
-	f, err := os.Create(out + ".sqar")
+	f, err := os.Create(outPath + ".sqar")
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
+	// debug: compute index size
+	// write header
+	fmt.Printf("DEBUG PACK: staged=%d stringTableLen=%d entrySize=%d indexSize=%d\n", len(staged), len(st.Bytes()), entrySize, indexSize)
+
 	header := FileHeader{
 		Magic:     Magic,
 		Version:   Version,
+		Flags:     0,
 		IndexSize: indexSize,
 	}
 	if opts.Compress {
 		header.Flags |= FlagCompressed
 	}
 
-	binary.Write(f, binary.LittleEndian, &header)
-
-	dataStart := int64(int64(binary.Size(header)) + int64(indexSize))
-	curOffset := uint64(0)
-
-	for i := range staged {
-		staged[i].entry.DataOffset = curOffset
-
-		binary.Write(f, binary.LittleEndian, staged[i].entry.PathLength)
-		f.WriteString(staged[i].entry.Path)
-		binary.Write(f, binary.LittleEndian, staged[i].entry.DataOffset)
-		binary.Write(f, binary.LittleEndian, staged[i].entry.CompressionSize)
-		binary.Write(f, binary.LittleEndian, staged[i].entry.RawSize)
-
-		curOffset += staged[i].entry.CompressionSize + 8
+	if err := binary.Write(f, binary.LittleEndian, &header); err != nil {
+		return err
 	}
 
-	f.Seek(dataStart, io.SeekStart)
+	// Write number of entries, then entries (fixed-size), then string table, then file data.
+	if err := binary.Write(f, binary.LittleEndian, uint32(len(staged))); err != nil {
+		return err
+	}
+	curOffset := uint64(0)
+	for i := range staged {
+		staged[i].entry.DataOffset = curOffset
+		e := &staged[i].entry
+		if err := binary.Write(f, binary.LittleEndian, e.PathOffset); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.LittleEndian, e.PathLength); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.LittleEndian, e.Flags); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.LittleEndian, e.DataOffset); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.LittleEndian, e.CompressionSize); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.LittleEndian, e.RawSize); err != nil {
+			return err
+		}
 
+		curOffset += e.CompressionSize + 8
+	}
+
+	// write string table
+	if _, err := f.Write(st.Bytes()); err != nil {
+		return err
+	}
+
+	// write data (current file offset is start of data)
 	for _, s := range staged {
-		binary.Write(f, binary.LittleEndian, s.entry.RawSize)
-		f.Write(s.data)
+		if err := binary.Write(f, binary.LittleEndian, s.entry.RawSize); err != nil {
+			return err
+		}
+		if _, err := f.Write(s.data); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func List(archive string) ([]IndexEntry, error) {
+// ---------- LIST ----------
+
+func List(archive string) ([]IndexEntry, []byte, error) {
 	f, err := os.Open(archive)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 
 	var h FileHeader
 	if err := binary.Read(f, binary.LittleEndian, &h); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if h.Magic != Magic {
-		return nil, errors.New("file is not a valid SQAR archive")
+		return nil, nil, errors.New("not a SQAR archive")
 	}
 
-	var entries []IndexEntry
-	read := uint64(0)
+	stLen := int(h.IndexSize)
+	stBytes := make([]byte, stLen)
+	if _, err := io.ReadFull(f, stBytes); err != nil {
+		return nil, nil, err
+	}
 
-	for read < h.IndexSize {
-		var e IndexEntry
-		binary.Read(f, binary.LittleEndian, &e.PathLength)
-		buf := make([]byte, e.PathLength)
-		f.Read(buf)
-		e.Path = string(buf)
+	if stLen < 4 {
+		return nil, nil, errors.New("index too small")
+	}
+	read := 0
+	count := int(binary.LittleEndian.Uint32(stBytes[read : read+4]))
+	read += 4
 
-		binary.Read(f, binary.LittleEndian, &e.DataOffset)
-		binary.Read(f, binary.LittleEndian, &e.CompressionSize)
-		binary.Read(f, binary.LittleEndian, &e.RawSize)
-
-		read += 2 + uint64(e.PathLength) + 8 + 8 + 8
+	entries := make([]IndexEntry, 0, count)
+	for i := 0; i < count; i++ {
+		if read+entrySize > stLen {
+			return nil, nil, errors.New("index truncated")
+		}
+		e := IndexEntry{}
+		e.PathOffset = binary.LittleEndian.Uint32(stBytes[read : read+4])
+		read += 4
+		e.PathLength = binary.LittleEndian.Uint16(stBytes[read : read+2])
+		read += 2
+		e.Flags = binary.LittleEndian.Uint16(stBytes[read : read+2])
+		read += 2
+		e.DataOffset = binary.LittleEndian.Uint64(stBytes[read : read+8])
+		read += 8
+		e.CompressionSize = binary.LittleEndian.Uint64(stBytes[read : read+8])
+		read += 8
+		e.RawSize = binary.LittleEndian.Uint64(stBytes[read : read+8])
+		read += 8
 		entries = append(entries, e)
 	}
 
-	return entries, nil
+	// remaining bytes are the string table
+	stringTable := stBytes[read:]
+
+	return entries, stringTable, nil
 }
+
+// ---------- UNPACK (memory-mapped) ----------
 
 func Unpack(archive, outDir string) error {
 	f, err := os.Open(archive)
@@ -261,35 +316,60 @@ func Unpack(archive, outDir string) error {
 	}
 	defer f.Close()
 
-	var h FileHeader
-	binary.Read(f, binary.LittleEndian, &h)
-
-	entries, err := List(archive)
+	stat, err := f.Stat()
 	if err != nil {
 		return err
 	}
 
-	database := int64(int64(binary.Size(h)) + int64(h.IndexSize))
+	data, err := syscall.Mmap(int(f.Fd()), 0, int(stat.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	defer syscall.Munmap(data)
 
+	var h FileHeader
+	buf := bytes.NewReader(data[:binary.Size(FileHeader{})])
+	binary.Read(buf, binary.LittleEndian, &h)
+
+	entries, stBytes, err := List(archive)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("DEBUG: entries=%d stringTableLen=%d\n", len(entries), len(stBytes))
+
+	// data region starts after header + index region
+	dataStart := int64(binary.Size(FileHeader{})) + int64(h.IndexSize)
 	for _, e := range entries {
-		f.Seek(database+int64(e.DataOffset), io.SeekStart)
-
-		var rawSize uint64
-		binary.Read(f, binary.LittleEndian, &rawSize)
-
-		buf := make([]byte, e.CompressionSize)
-		f.Read(buf)
+		fmt.Printf("DEBUG: entry pathOffset=%d pathLen=%d flags=%d dataOffset=%d compSize=%d rawSize=%d\n", e.PathOffset, e.PathLength, e.Flags, e.DataOffset, e.CompressionSize, e.RawSize)
+		offset := dataStart + int64(e.DataOffset)
+		if offset+8 > int64(len(data)) {
+			return errors.New("archive corrupted: invalid data offset")
+		}
+		payloadStart := offset + 8
+		payloadEnd := payloadStart + int64(e.CompressionSize)
+		if payloadEnd > int64(len(data)) {
+			return errors.New("archive corrupted: invalid payload size")
+		}
+		payload := data[payloadStart:payloadEnd]
 
 		var out []byte
-		if h.Flags&FlagCompressed != 0 {
-			out = sqarDecompress(buf, rawSize)
+		if e.Flags&1 != 0 {
+			dec, err := decompressBytes(payload)
+			if err != nil {
+				return err
+			}
+			out = dec
 		} else {
-			out = buf
+			out = make([]byte, len(payload))
+			copy(out, payload)
 		}
 
-		dest := filepath.Join(outDir, e.Path)
+		dest := filepath.Join(outDir, string(stBytes[e.PathOffset:e.PathOffset+uint32(e.PathLength)]))
 		os.MkdirAll(filepath.Dir(dest), 0755)
-		os.WriteFile(dest, out, 0644)
+		if err := os.WriteFile(dest, out, 0644); err != nil {
+			return err
+		}
 	}
 
 	return nil

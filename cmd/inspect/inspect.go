@@ -17,7 +17,7 @@ var InspectCmd = &cobra.Command{
 		archive := args[0]
 		quiet, _ := cmd.Flags().GetBool("quiet")
 
-		entries, err := pkg.List(archive)
+		entries, stBytes, err := pkg.List(archive)
 		if err != nil {
 			fmt.Printf("Error inspecting archive %s: %s\n", archive, err)
 			os.Exit(1)
@@ -25,11 +25,12 @@ var InspectCmd = &cobra.Command{
 
 		fmt.Printf("Files in archive %s:\n\r", archive)
 		for i, e := range entries {
+			path := string(stBytes[e.PathOffset : e.PathOffset+uint32(e.PathLength)])
 			if quiet {
-				fmt.Printf("%d: %s\n", i, e.Path)
+				fmt.Printf("%d: %s\n", i, path)
 			} else {
 				fmt.Printf("=====================\n\r%d:\n\r\tPath: %s\n\r\tCompressed: %d\n\r\tRaw: %d\n\r\tOffset: %d\n",
-					i, e.Path, e.CompressionSize, e.RawSize, e.DataOffset)
+					i, path, e.CompressionSize, e.RawSize, e.DataOffset)
 			}
 		}
 	},
