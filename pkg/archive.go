@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,6 +77,10 @@ func (st *StringTable) Bytes() []byte { return st.buf.Bytes() }
 
 const (
 	entrySize = 4 + 2 + 2 + 8 + 8 + 8 // PathOffset + PathLength + Flags + DataOffset + CompressionSize + RawSize
+)
+
+const (
+	FlagSolid = 1 << 1
 )
 
 var skipCompressExt = map[string]bool{
@@ -166,8 +171,9 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 	}
 
 	staged := []struct {
-		entry   IndexEntry
-		tmpPath string
+		entry     IndexEntry
+		tmpPath   string
+		tmpOffset int64
 	}{}
 
 	st := NewStringTable()
@@ -187,20 +193,40 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 		files = append(files, fileItem{path: p.full, rel: rel, offset: pathOffset})
 	}
 
+	// compute total/raw size and decide on solid compression heuristic
+	var totalRaw int64
+	for _, fi := range files {
+		if info, err := os.Stat(fi.path); err == nil {
+			totalRaw += info.Size()
+		}
+	}
+	avg := int64(0)
+	if len(files) > 0 {
+		avg = totalRaw / int64(len(files))
+	}
+
 	// create encoder pool based on opts.Level
-	level := zstd.SpeedDefault
+	// default to better compression to improve overall archive ratio
+	level := zstd.SpeedBetterCompression
 	switch strings.ToLower(opts.Level) {
 	case "fast":
 		level = zstd.SpeedFastest
 	case "best":
 		level = zstd.SpeedBetterCompression
 	default:
-		level = zstd.SpeedDefault
+		// keep BetterCompression when opts.Level not specified
 	}
 
 	workers := opts.Workers
 	if workers <= 0 {
-		workers = 4
+		workers = 0
+	}
+	if workers <= 0 {
+		// default to number of logical CPUs
+		workers = 1
+		if n := runtime.NumCPU(); n > 0 {
+			workers = n
+		}
 	}
 
 	type result struct {
@@ -209,6 +235,7 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 		compSize   int64
 		rawSize    int64
 		compressed bool
+		tmpOffset  int64
 		err        error
 	}
 
@@ -280,36 +307,110 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 		close(results)
 	}()
 
-	stagedMap := make([]struct {
-		entry   IndexEntry
-		tmpPath string
-	}, len(files))
-	for r := range results {
-		if r.err != nil {
-			return r.err
-		}
-		fi := files[r.idx]
-		entry := IndexEntry{PathOffset: fi.offset, PathLength: uint16(len(fi.rel)), Flags: 0}
-		if r.compressed {
-			entry.Flags = 1
-		}
-		entry.CompressionSize = uint64(r.compSize)
-		entry.RawSize = uint64(r.rawSize)
-		stagedMap[r.idx] = struct {
-			entry   IndexEntry
-			tmpPath string
-		}{entry: entry, tmpPath: r.tmpPath}
+	solid := false
+	if opts.Compress && len(files) > 1 && avg < 65536 {
+		solid = true
 	}
 
-	// preserve original ordering
-	for i := range stagedMap {
-		staged = append(staged, stagedMap[i])
+	if solid {
+		tmpAll, err := os.CreateTemp("", "sqar-solid-*")
+		if err != nil {
+			return err
+		}
+		enc, err := zstd.NewWriter(tmpAll, zstd.WithEncoderLevel(level))
+		if err != nil {
+			tmpAll.Close()
+			return err
+		}
+
+		// iterate files sequentially, writing rawSize+data into encoder, recording offsets/sizes
+		var curOffsetInTmp int64
+		for i, fi := range files {
+			srcF, err := os.Open(fi.path)
+			if err != nil {
+				enc.Close()
+				tmpAll.Close()
+				return err
+			}
+			srcInfo, _ := srcF.Stat()
+			rawSize := uint64(srcInfo.Size())
+
+			// current compressed file size before writing
+			stInfo, _ := tmpAll.Stat()
+			start := stInfo.Size()
+
+			// write rawSize then file data into encoder
+			if err := binary.Write(enc, binary.LittleEndian, rawSize); err != nil {
+				srcF.Close()
+				enc.Close()
+				tmpAll.Close()
+				return err
+			}
+			if _, err := io.Copy(enc, srcF); err != nil {
+				srcF.Close()
+				enc.Close()
+				tmpAll.Close()
+				return err
+			}
+			srcF.Close()
+			// flush encoder to ensure data reaches underlying file
+			if err := enc.Flush(); err != nil {
+				enc.Close()
+				tmpAll.Close()
+				return err
+			}
+
+			// new size and compSize
+			stInfo2, _ := tmpAll.Stat()
+			end := stInfo2.Size()
+			compSize := end - start
+
+			entry := IndexEntry{PathOffset: fi.offset, PathLength: uint16(len(fi.rel)), Flags: 1, DataOffset: 0, CompressionSize: uint64(compSize), RawSize: rawSize}
+			staged = append(staged, struct {
+				entry     IndexEntry
+				tmpPath   string
+				tmpOffset int64
+			}{entry: entry, tmpPath: tmpAll.Name(), tmpOffset: start})
+			curOffsetInTmp += compSize + 8
+			_ = i
+		}
+
+		enc.Close()
+		tmpAll.Close()
+	} else {
+		stagedMap := make([]struct {
+			entry     IndexEntry
+			tmpPath   string
+			tmpOffset int64
+		}, len(files))
+		for r := range results {
+			if r.err != nil {
+				return r.err
+			}
+			fi := files[r.idx]
+			entry := IndexEntry{PathOffset: fi.offset, PathLength: uint16(len(fi.rel)), Flags: 0}
+			if r.compressed {
+				entry.Flags = 1
+			}
+			entry.CompressionSize = uint64(r.compSize)
+			entry.RawSize = uint64(r.rawSize)
+			stagedMap[r.idx] = struct {
+				entry     IndexEntry
+				tmpPath   string
+				tmpOffset int64
+			}{entry: entry, tmpPath: r.tmpPath, tmpOffset: 0}
+		}
+
+		// preserve original ordering
+		for i := range stagedMap {
+			staged = append(staged, stagedMap[i])
+		}
 	}
 
 	// include 4 bytes for entry count
 	indexSize := uint64(len(st.Bytes())) + uint64(len(staged))*uint64(entrySize) + 4
 
-	f, err := os.Create(outPath + ".sqar")
+	f, err := os.Create(outPath)
 	if err != nil {
 		return err
 	}
@@ -323,6 +424,10 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 	}
 	if opts.Compress {
 		header.Flags |= FlagCompressed
+	}
+	// if solid compression chosen, mark flag
+	if solid {
+		header.Flags |= FlagSolid
 	}
 
 	if err := binary.Write(f, binary.LittleEndian, &header); err != nil {
@@ -356,7 +461,11 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 			return err
 		}
 
-		curOffset += e.CompressionSize + 8
+		if header.Flags&FlagSolid != 0 {
+			curOffset += e.CompressionSize
+		} else {
+			curOffset += e.CompressionSize + 8
+		}
 	}
 
 	// write string table
@@ -365,21 +474,42 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 	}
 
 	// write data (current file offset is start of data)
-	for _, s := range staged {
-		if err := binary.Write(f, binary.LittleEndian, s.entry.RawSize); err != nil {
-			return err
-		}
-		// stream copy from temp file
-		tmp, err := os.Open(s.tmpPath)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(f, tmp); err != nil {
+	if header.Flags&FlagSolid != 0 {
+		// solid: staged entries point into one or more compressed blobs; copy per-entry ranges
+		for _, s := range staged {
+			// open blob and copy the exact compressed range
+			tmp, err := os.Open(s.tmpPath)
+			if err != nil {
+				return err
+			}
+			if _, err := tmp.Seek(s.tmpOffset, io.SeekStart); err != nil {
+				tmp.Close()
+				return err
+			}
+			if _, err := io.CopyN(f, tmp, int64(s.entry.CompressionSize)); err != nil {
+				tmp.Close()
+				return err
+			}
 			tmp.Close()
-			return err
+			os.Remove(s.tmpPath)
 		}
-		tmp.Close()
-		os.Remove(s.tmpPath)
+	} else {
+		for _, s := range staged {
+			if err := binary.Write(f, binary.LittleEndian, s.entry.RawSize); err != nil {
+				return err
+			}
+			// stream copy from temp file
+			tmp, err := os.Open(s.tmpPath)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tmp); err != nil {
+				tmp.Close()
+				return err
+			}
+			tmp.Close()
+			os.Remove(s.tmpPath)
+		}
 	}
 
 	return nil
@@ -476,26 +606,51 @@ func Unpack(archive, outDir string) error {
 	for _, e := range entries {
 		// unpack each entry
 		offset := dataStart + int64(e.DataOffset)
-		if offset+8 > int64(len(data)) {
-			return errors.New("archive corrupted: invalid data offset")
-		}
-		payloadStart := offset + 8
-		payloadEnd := payloadStart + int64(e.CompressionSize)
-		if payloadEnd > int64(len(data)) {
-			return errors.New("archive corrupted: invalid payload size")
-		}
-		payload := data[payloadStart:payloadEnd]
-
 		var out []byte
-		if e.Flags&1 != 0 {
-			dec, err := decompressBytes(payload)
-			if err != nil {
-				return err
+		if h.Flags&FlagSolid != 0 {
+			// solid mode: entry.DataOffset points to start of compressed segment
+			payloadStart := offset
+			payloadEnd := payloadStart + int64(e.CompressionSize)
+			if payloadEnd > int64(len(data)) {
+				return errors.New("archive corrupted: invalid payload size")
 			}
-			out = dec
+			payload := data[payloadStart:payloadEnd]
+			if e.Flags&1 != 0 {
+				dec, err := decompressBytes(payload)
+				if err != nil {
+					return err
+				}
+				if len(dec) < 8 {
+					return errors.New("archive corrupted: invalid decompressed segment")
+				}
+				// first 8 bytes are rawSize, remainder is file data
+				rawSize := binary.LittleEndian.Uint64(dec[:8])
+				_ = rawSize
+				out = dec[8:]
+			} else {
+				out = make([]byte, len(payload))
+				copy(out, payload)
+			}
 		} else {
-			out = make([]byte, len(payload))
-			copy(out, payload)
+			if offset+8 > int64(len(data)) {
+				return errors.New("archive corrupted: invalid data offset")
+			}
+			payloadStart := offset + 8
+			payloadEnd := payloadStart + int64(e.CompressionSize)
+			if payloadEnd > int64(len(data)) {
+				return errors.New("archive corrupted: invalid payload size")
+			}
+			payload := data[payloadStart:payloadEnd]
+			if e.Flags&1 != 0 {
+				dec, err := decompressBytes(payload)
+				if err != nil {
+					return err
+				}
+				out = dec
+			} else {
+				out = make([]byte, len(payload))
+				copy(out, payload)
+			}
 		}
 
 		dest := filepath.Join(outDir, string(stBytes[e.PathOffset:e.PathOffset+uint32(e.PathLength)]))
@@ -539,8 +694,11 @@ func Append(archive string, sources []string, opts PackOptions) error {
 
 	for _, e := range entries {
 		payloadOffset := dataStart + int64(e.DataOffset)
-		// payload starts after 8-byte raw size header
+		// payload starts after 8-byte raw size header unless archive was solid
 		payloadStart := payloadOffset + 8
+		if h.Flags&FlagSolid != 0 {
+			payloadStart = payloadOffset
+		}
 		tmp, err := os.CreateTemp("", "sqar-old-*")
 		if err != nil {
 			return err
