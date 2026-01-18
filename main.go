@@ -1,6 +1,7 @@
 package main
 
 import (
+	appendcmd "sqar/cmd/append"
 	inspect "sqar/cmd/inspect"
 	pack "sqar/cmd/pack"
 	unpack "sqar/cmd/unpack"
@@ -20,5 +21,6 @@ func main() {
 	rootCmd.AddCommand(unpack.UnpackCmd)
 	rootCmd.AddCommand(inspect.InspectCmd)
 	rootCmd.AddCommand(version.VersionCmd)
+	rootCmd.AddCommand(appendcmd.AppendCmd)
 	rootCmd.Execute()
 }

@@ -11,30 +11,36 @@ import (
 var (
 	compress      bool
 	includeParent bool
+	level         string
+	workers       int
 )
 
 var PackCmd = &cobra.Command{
-	Use:   "pack [directory] [output]",
-	Short: "Pack a directory into a SQAR archive",
-	Long:  "Pack all files recursively in a directory into a single SQAR archive.",
-	Args:  cobra.ExactArgs(2),
+	Use:   "pack [sources...] [output]",
+	Short: "Pack files and directories into a SQAR archive",
+	Long:  "Pack multiple files and directories recursively into a single SQAR archive.",
+	Args:  cobra.MinimumNArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
-		src := args[0]
-		out := args[1]
+		out := args[len(args)-1]
+		srcs := args[:len(args)-1]
 
-		err := pkg.Pack(src, out, pkg.PackOptions{
+		err := pkg.Pack(srcs, out, pkg.PackOptions{
 			Compress:      compress,
 			IncludeParent: includeParent,
+			Level:         level,
+			Workers:       workers,
 		})
 		if err != nil {
-			fmt.Printf("Error packing directory %s: %s\n", src, err)
+			fmt.Printf("Error packing sources %v into %s: %s\n", srcs, out, err)
 			os.Exit(1)
 		}
-		fmt.Printf("Successfully packed %s into %s.sqar", src, out)
+		fmt.Printf("Successfully packed %v into %s.sqar", srcs, out)
 	},
 }
 
 func init() {
 	PackCmd.Flags().BoolVarP(&compress, "compress", "C", false, "Enable file compression")
 	PackCmd.Flags().BoolVarP(&includeParent, "include-parent", "P", false, "Include a parent directory in the archival process")
+	PackCmd.Flags().StringVarP(&level, "level", "L", "default", "Compression level: fast|default|best")
+	PackCmd.Flags().IntVarP(&workers, "workers", "w", 0, "Number of compression workers (0 = auto)")
 }
