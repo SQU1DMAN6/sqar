@@ -212,9 +212,9 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 	case "fast":
 		level = zstd.SpeedFastest
 	case "best":
-		level = zstd.SpeedBetterCompression
+		level = zstd.SpeedBestCompression
 	default:
-		// keep BetterCompression when opts.Level not specified
+		level = zstd.SpeedBetterCompression
 	}
 
 	workers := opts.Workers
