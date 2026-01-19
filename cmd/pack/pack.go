@@ -15,6 +15,7 @@ var (
 	includeParent bool
 	level         string
 	workers       int
+	method        string
 )
 
 var PackCmd = &cobra.Command{
@@ -72,6 +73,7 @@ var PackCmd = &cobra.Command{
 			IncludeParent: includeParent,
 			Level:         level,
 			Workers:       workers,
+			Method:        method,
 		})
 		if err != nil {
 			fmt.Printf("Error packing sources %v into %s: %s\n", srcs, out, err)
@@ -85,6 +87,7 @@ func init() {
 	PackCmd.Flags().BoolVarP(&compress, "compress", "C", false, "Enable file compression")
 	PackCmd.Flags().BoolVarP(&includeParent, "include-parent", "P", false, "Include a parent directory in the archival process")
 	PackCmd.Flags().StringVarP(&level, "level", "L", "default", "Compression level: fast|default|best")
+	PackCmd.Flags().StringVarP(&method, "method", "M", "zstd", "Compression method: zstd|lz77|huffman")
 	PackCmd.Flags().IntVarP(&workers, "workers", "w", 0, "Number of compression workers")
 	PackCmd.Flags().StringSliceP("input", "I", nil, "Input files/directories")
 	PackCmd.Flags().StringP("output", "O", "", "Output archive path")

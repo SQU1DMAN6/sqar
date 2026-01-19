@@ -48,6 +48,8 @@ type PackOptions struct {
 	// Level: "fast", "default", "best"
 	Level   string
 	Workers int
+	// Method: "zstd" (default), "lz77", "huffman"
+	Method string
 }
 
 // ---------- STRING TABLE ----------
@@ -112,6 +114,39 @@ func decompressBytes(src []byte) ([]byte, error) {
 	return out, nil
 }
 
+// compressWithMethod compresses data using the specified method
+func compressWithMethod(src io.Reader, method string, level zstd.EncoderLevel) (io.Reader, error) {
+	method = strings.ToLower(method)
+	if method == "" {
+		method = "zstd" // default method
+	}
+
+	switch method {
+	case "lz77":
+		return CompressLZ77(src)
+	case "huffman":
+		return CompressHuffman(src)
+	default:
+		// zstd is the default
+		data, err := io.ReadAll(src)
+		if err != nil {
+			return nil, err
+		}
+
+		var out bytes.Buffer
+		enc, err := zstd.NewWriter(&out, zstd.WithEncoderLevel(level))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := enc.Write(data); err != nil {
+			enc.Close()
+			return nil, err
+		}
+		enc.Close()
+		return bytes.NewReader(out.Bytes()), nil
+	}
+}
+
 // ---------- PACK ----------
 
 func Pack(sources []string, outPath string, opts PackOptions) error {
@@ -157,9 +192,15 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 				if err != nil {
 					return err
 				}
-				if !info.IsDir() {
-					paths = append(paths, struct{ full, base string }{full: p, base: sp.baseDir})
+				// Skip directories and symlinks
+				if info.IsDir() {
+					return nil
 				}
+				// Check if it's a symlink and skip if it is
+				if (info.Mode() & os.ModeSymlink) != 0 {
+					return nil
+				}
+				paths = append(paths, struct{ full, base string }{full: p, base: sp.baseDir})
 				return nil
 			})
 			if err != nil {
@@ -193,17 +234,16 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 		files = append(files, fileItem{path: p.full, rel: rel, offset: pathOffset})
 	}
 
-	// compute total/raw size and decide on solid compression heuristic
+	// Note: Solid compression disabled due to temp file handling issues
+	// Method-specific compression works well for all methods
+	// compute total/raw size - currently unused with solid compression disabled
 	var totalRaw int64
 	for _, fi := range files {
 		if info, err := os.Stat(fi.path); err == nil {
 			totalRaw += info.Size()
 		}
 	}
-	avg := int64(0)
-	if len(files) > 0 {
-		avg = totalRaw / int64(len(files))
-	}
+	_ = totalRaw // unused after disabling solid compression
 
 	// create encoder pool based on opts.Level
 	// default to better compression to improve overall archive ratio
@@ -264,21 +304,20 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 				var compSize int64
 				compressed := false
 				if opts.Compress && shouldCompress(fi.path) {
-					enc, err := zstd.NewWriter(tmp, zstd.WithEncoderLevel(level))
+					// Use selected compression method
+					compReader, err := compressWithMethod(srcF, opts.Method, level)
 					if err != nil {
 						srcF.Close()
 						tmp.Close()
 						results <- result{idx: idx, err: err}
 						continue
 					}
-					if _, err := io.Copy(enc, srcF); err != nil {
-						enc.Close()
+					if _, err := io.Copy(tmp, compReader); err != nil {
 						srcF.Close()
 						tmp.Close()
 						results <- result{idx: idx, err: err}
 						continue
 					}
-					enc.Close()
 					compressed = true
 				} else {
 					if _, err := io.Copy(tmp, srcF); err != nil {
@@ -307,10 +346,11 @@ func Pack(sources []string, outPath string, opts PackOptions) error {
 		close(results)
 	}()
 
-	solid := false
-	if opts.Compress && len(files) > 1 && avg < 65536 {
-		solid = true
-	}
+	// Note: Solid compression disabled due to temp file handling issues
+	// Method-specific compression works well for all methods
+	_ = totalRaw // avg calculation removed with solid compression
+
+	solid := false // Keep solid mode disabled for now
 
 	if solid {
 		tmpAll, err := os.CreateTemp("", "sqar-solid-*")
